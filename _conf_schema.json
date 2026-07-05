@@ -1,0 +1,79 @@
+{
+    "conversation_rounds_limit": {
+        "description": "保留的user/assistant对话轮数",
+        "type": "int",
+        "default": 10
+    },
+    "enable_command_filter": {
+        "description": "是否启用群聊指令消息过滤（以指定前缀开头的消息不计入上下文）",
+        "type": "bool",
+        "default": true
+    },
+    "command_prefixes": {
+        "description": "指令消息前缀列表",
+        "type": "list",
+        "default": ["/"],
+        "item_type": "string"
+    },
+    "wake_words": {
+        "description": "唤醒词列表：消息中任意位置包含这些词就触发回复",
+        "type": "list",
+        "default": [],
+        "item_type": "string"
+    },
+    "vip_qq": {
+        "description": "VIP用户QQ号：此用户的消息会被优先响应",
+        "type": "string",
+        "default": ""
+    },
+    "vip_always_respond": {
+        "description": "是否对VIP用户的所有消息都响应（即使不包含唤醒词）",
+        "type": "bool",
+        "default": false
+    },
+    "enable_private_control": {
+        "description": "是否启用私聊场景会话控制功能",
+        "type": "bool",
+        "default": false
+    },
+    "private_conversation_rounds_limit": {
+        "description": "私聊场景保留的user/assistant对话轮数",
+        "type": "int",
+        "default": 10
+    },
+    "private_image_carry_rounds": {
+        "description": "私聊场景控制携带图片的轮数",
+        "type": "int",
+        "default": 2
+    },
+    "enable_forward_analysis": {
+        "description": "是否启用合并转发消息分析",
+        "type": "bool",
+        "default": true
+    },
+    "enable_image_recognition": {
+        "description": "是否启用图片识别（关闭则所有图片变成[图片]占位符）",
+        "type": "bool",
+        "default": true
+    },
+    "image_caption": {
+        "description": "图片处理模式：true=用便宜模型转述成文字（省钱），false=base64原图注入（贵！）",
+        "type": "bool",
+        "default": true
+    },
+    "image_caption_provider_id": {
+        "description": "图片转述使用的Provider ID（留空则使用默认Provider，注意默认可能很贵）",
+        "type": "string",
+        "default": ""
+    },
+    "image_caption_prompt": {
+        "description": "图片转述的提示词",
+        "type": "string",
+        "default": "用中文简要描述这张图片的内容，包括文字、人物、场景等关键信息。"
+    },
+    "image_carry_rounds": {
+        "description": "群聊场景控制携带图片的轮数，只保留最后N轮中的图片",
+        "type": "int",
+        "default": 2
+    }
+}
