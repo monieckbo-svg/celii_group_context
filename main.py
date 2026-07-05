@@ -1,5 +1,8 @@
 import datetime
 import traceback
+from zoneinfo import ZoneInfo
+
+BEIJING = ZoneInfo("Asia/Shanghai")  # 消息时间戳锚定北京
 import uuid
 from collections import defaultdict
 from typing import Optional, List, Tuple
@@ -318,7 +321,7 @@ class GroupContextPlugin(Star):
             logger.error(traceback.format_exc())
 
     async def handle_message(self, event: AstrMessageEvent):
-        datetime_str = datetime.datetime.now().strftime("%H:%M:%S")
+        datetime_str = datetime.datetime.now(BEIJING).strftime("%H:%M:%S")
         current_message_content = []
         full_text = f"[{event.message_obj.sender.nickname}/{datetime_str}]: "
 
