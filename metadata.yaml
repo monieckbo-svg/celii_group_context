@@ -2,4 +2,4 @@ name: celii_group_context
 desc: "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤 (celii-astra fork)"
 version: "2.0.0"
 author: celii-astra
-repo: ""
+repo: https://github.com/monieckbo-svg/celii_group_context
