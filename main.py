@@ -27,7 +27,7 @@ CHATROOM_SYSTEM_PROMPT = "You are now in a chatroom. The chat history is as abov
 DEFAULT_CAPTION_PROMPT = "用中文简要描述这张图片的内容，包括文字、人物、场景等关键信息。"
 
 
-@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤", "2.0.0")
+@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤", "2.0.1")
 class GroupContextPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -299,7 +299,7 @@ class GroupContextPlugin(Star):
 
         has_valid_content = False
         for comp in event.message_obj.message:
-            if isinstance(comp, (Plain, Image)):
+            if isinstance(comp, (Plain, Image, At)):
                 has_valid_content = True
                 break
             if IS_AIOCQHTTP and isinstance(comp, Forward):
@@ -319,6 +319,16 @@ class GroupContextPlugin(Star):
         except BaseException as e:
             logger.error(f"记录群聊消息失败: {e}")
             logger.error(traceback.format_exc())
+            # 降级兜底：处理失败也至少把纯文本存进缓冲，别让这条消息彻底消失
+            try:
+                if message_text.strip():
+                    ts = datetime.datetime.now(BEIJING).strftime("%H:%M:%S")
+                    self.session_chats[event.unified_msg_origin].append(
+                        [{"type": "text", "text": f"[{event.message_obj.sender.nickname}/{ts}]: {message_text}"}]
+                    )
+                    logger.info("[celii_gc] 已降级保存该消息的纯文本")
+            except Exception:
+                pass
 
     async def handle_message(self, event: AstrMessageEvent):
         datetime_str = datetime.datetime.now(BEIJING).strftime("%H:%M:%S")
@@ -449,7 +459,9 @@ class GroupContextPlugin(Star):
     @filter.on_llm_request()
     async def on_req_llm(self, event: AstrMessageEvent, req: ProviderRequest):
         """群聊场景：将session_chats注入LLM请求上下文"""
-        if event.unified_msg_origin not in self.session_chats:
+        # 用 get 判断：键存在但列表为空（上次注入后被clear）也视为无内容，
+        # 直接让路，避免注入一条只有CHATROOM_SYSTEM_PROMPT的空壳消息导致模型"看不到新消息"
+        if not self.session_chats.get(event.unified_msg_origin):
             return
 
         rounds_limit = int(self.get_cfg("conversation_rounds_limit", 10))
@@ -493,6 +505,8 @@ class GroupContextPlugin(Star):
 
         req.contexts.append(user_message)
         self.session_chats[event.unified_msg_origin].clear()
+        # 标记本轮已注入群聊上下文，clear_prompt 据此决定是否清空prompt
+        event.set_extra("celii_gc_injected", True)
 
     @filter.on_llm_request()
     async def on_req_llm_private(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -505,8 +519,12 @@ class GroupContextPlugin(Star):
 
     @filter.on_llm_request(priority=-10000)
     async def on_req_llm_clear_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
-        """群聊场景：清空prompt防止重复内容"""
+        """群聊场景：清空prompt防止重复内容（仅在本轮确实注入了群聊上下文时）"""
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+        # 本轮没注入群聊上下文（缓冲为空/消息丢失）时不清prompt，
+        # 保留AstrBot原生填入的用户消息作为兜底，避免模型收到完全空白的请求
+        if not event.get_extra("celii_gc_injected"):
             return
         req.prompt = ""
         if req.contexts:
