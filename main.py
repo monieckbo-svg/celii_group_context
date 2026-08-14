@@ -23,11 +23,11 @@ except ImportError:
     IS_AIOCQHTTP = False
 
 
-CHATROOM_SYSTEM_PROMPT = "You are now in a chatroom. The chat history is as above. Now, new messages are coming. Please react to it."
+CHATROOM_SYSTEM_PROMPT = "以下是群里你未读的聊天记录，仅供背景参考。用户最新对你说的话在本次消息里，请回应最新消息。"
 DEFAULT_CAPTION_PROMPT = "用中文简要描述这张图片的内容，包括文字、人物、场景等关键信息。"
 
 
-@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤", "2.0.1")
+@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤", "2.0.2")
 class GroupContextPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -314,6 +314,11 @@ class GroupContextPlugin(Star):
             if self._check_wake_words(event):
                 event.is_at_or_wake_command = True
 
+        # 触发回复的消息（@/唤醒词）走AstrBot原生通道，会作为当前消息直接发给模型，
+        # 不入缓冲——否则LLM请求先于本handler执行，缓冲注入永远滞后一条（慢一拍bug）
+        if event.is_at_or_wake_command:
+            return
+
         try:
             await self.handle_message(event)
         except BaseException as e:
@@ -475,24 +480,11 @@ class GroupContextPlugin(Star):
         self._control_conversation_rounds(req, rounds_limit)
         self._control_image_carry_rounds(req, self.image_carry_rounds)
 
-        # 构建群聊上下文
+        # 构建群聊背景上下文（不动req.prompt——原生prompt就是用户当前这条消息）
         combined_content = [{"type": "text", "text": CHATROOM_SYSTEM_PROMPT + "\n"}]
-        text_prompt_parts = []
 
         for message in self.session_chats[event.unified_msg_origin]:
             combined_content.extend(message)
-            text_part = ""
-            for comp in message:
-                if comp["type"] == "text":
-                    text_part += comp["text"]
-                elif comp["type"] == "image_url":
-                    text_part += " [图片]"
-            if text_part.strip():
-                text_prompt_parts.append(text_part.strip())
-
-        req.prompt = ""
-        if text_prompt_parts:
-            req.prompt = "\n---\n".join(text_prompt_parts)
 
         has_images = any(item.get("type") == "image_url" for item in combined_content)
         if has_images:
@@ -505,8 +497,6 @@ class GroupContextPlugin(Star):
 
         req.contexts.append(user_message)
         self.session_chats[event.unified_msg_origin].clear()
-        # 标记本轮已注入群聊上下文，clear_prompt 据此决定是否清空prompt
-        event.set_extra("celii_gc_injected", True)
 
     @filter.on_llm_request()
     async def on_req_llm_private(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -519,14 +509,9 @@ class GroupContextPlugin(Star):
 
     @filter.on_llm_request(priority=-10000)
     async def on_req_llm_clear_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
-        """群聊场景：清空prompt防止重复内容（仅在本轮确实注入了群聊上下文时）"""
+        """群聊场景：清理历史中遗留的空user消息（不再清空prompt——prompt是用户当前消息，必须保留）"""
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
             return
-        # 本轮没注入群聊上下文（缓冲为空/消息丢失）时不清prompt，
-        # 保留AstrBot原生填入的用户消息作为兜底，避免模型收到完全空白的请求
-        if not event.get_extra("celii_gc_injected"):
-            return
-        req.prompt = ""
         if req.contexts:
             req.contexts = [
                 ctx for ctx in req.contexts
@@ -537,7 +522,7 @@ class GroupContextPlugin(Star):
 
     @filter.on_llm_response(priority=-10000)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """群聊场景：[skip]过滤 + 二次清空prompt"""
+        """群聊场景：[skip]过滤"""
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
             return
         if resp and resp.completion_text:
@@ -547,9 +532,6 @@ class GroupContextPlugin(Star):
                 resp.completion_text = ""
                 event.stop_event()
                 return
-        req = event.get_extra("provider_request")
-        if req is not None:
-            req.prompt = ""
 
     async def terminate(self):
         logger.info("[celii_gc] 插件已卸载")
