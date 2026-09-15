@@ -35,7 +35,7 @@ DEFAULT_ACTIVE_PROMPT = (
 )
 
 
-@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、概率主动搭话、[skip]过滤", "2.1.0")
+@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、概率主动搭话、[skip]过滤", "2.1.1")
 class GroupContextPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -74,6 +74,7 @@ class GroupContextPlugin(Star):
         self.active_reply_prompt = str(self.get_cfg("active_reply_prompt", "") or "")
         self.active_reply_group_whitelist = self.get_cfg("active_reply_group_whitelist", []) or []
         self._last_active_ts = {}  # umo -> 上次主动搭话的时间戳，用于冷却
+        self._persona_cache = {}   # umo -> 最近一次正常回复所用的人格 system_prompt
 
         # 启动日志
         logger.info("[celii_gc] 插件已初始化")
@@ -367,7 +368,7 @@ class GroupContextPlugin(Star):
     async def _maybe_active_reply(self, event: AstrMessageEvent):
         """潜水时按概率主动搭话。命中则用'主动开口'的引导语作为 prompt，
         当前群聊记录由 on_req_llm 作为背景注入，模型不会把群消息当成对自己说的话。
-        用 request_llm(conversation=conv) 是为了带上完整人格与会话历史。"""
+        人格用缓存的 system_prompt 独立带上，不共用主会话，故不污染历史。"""
         if not self.enable_active_reply or self.active_reply_possibility <= 0:
             return
 
@@ -390,37 +391,27 @@ class GroupContextPlugin(Star):
         if random.random() >= self.active_reply_possibility:
             return
 
-        # 命中：取当前会话，带上完整人格与历史
+        # 命中：用缓存的人格独立发起，绝不共用主会话——
+        # 引导语和可能的 [skip] 都不写进历史，正常唤醒回复因此不会被诱导 skip。
         provider = self.context.get_using_provider()
         if not provider:
             logger.warning("[celii_gc] 主动搭话：未配置 Provider，跳过")
             return
-        try:
-            cid = await self.context.conversation_manager.get_curr_conversation_id(
-                event.unified_msg_origin
+        system_prompt = self._persona_cache.get(event.unified_msg_origin)
+        if not system_prompt:
+            logger.debug(
+                "[celii_gc] 主动搭话：人格尚未缓存，本次跳过"
+                "（星星在该群被正常唤醒回复一次后，主动搭话即自动启用）"
             )
-            if not cid:
-                logger.warning(
-                    "[celii_gc] 主动搭话：当前群无活动会话，跳过"
-                    "（需关闭 平台设置->会话隔离 unique_session，并 /new 建会话）"
-                )
-                return
-            conv = await self.context.conversation_manager.get_conversation(
-                event.unified_msg_origin, cid
-            )
-            if not conv:
-                return
-        except BaseException:
-            logger.error(traceback.format_exc())
             return
 
         self._last_active_ts[event.unified_msg_origin] = now
         prompt = self.active_reply_prompt or DEFAULT_ACTIVE_PROMPT
         logger.info(f"[celii_gc] 主动搭话触发 | {event.unified_msg_origin}")
+        # 不传 conversation：不落主会话历史；群聊背景由 on_req_llm 注入 req.contexts。
         yield event.request_llm(
             prompt=prompt,
-            session_id=event.session_id,
-            conversation=conv,
+            system_prompt=system_prompt,
         )
 
     async def handle_message(self, event: AstrMessageEvent):
@@ -552,6 +543,10 @@ class GroupContextPlugin(Star):
     @filter.on_llm_request()
     async def on_req_llm(self, event: AstrMessageEvent, req: ProviderRequest):
         """群聊场景：将session_chats注入LLM请求上下文"""
+        # 顺手缓存这个群当前生效的人格 system_prompt，供主动搭话独立复用——
+        # 这样主动搭话不必共用会话(conversation)，就不会把引导语/[skip]写进主会话历史。
+        if req.system_prompt:
+            self._persona_cache[event.unified_msg_origin] = req.system_prompt
         # 用 get 判断：键存在但列表为空（上次注入后被clear）也视为无内容，
         # 直接让路，避免注入一条只有CHATROOM_SYSTEM_PROMPT的空壳消息导致模型"看不到新消息"
         if not self.session_chats.get(event.unified_msg_origin):
