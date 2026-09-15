@@ -78,5 +78,31 @@
     "description": "群聊场景控制携带图片的轮数，只保留最后N轮中的图片",
     "type": "int",
     "default": 2
+  },
+  "enable_active_reply": {
+    "description": "是否启用群聊概率主动搭话（潜水时按概率主动插话，非@/唤醒触发）",
+    "type": "bool",
+    "default": false
+  },
+  "active_reply_possibility": {
+    "description": "主动搭话概率(0-1)：每条未唤醒的群消息有多大几率触发一次主动插话。例如0.1=10%；0=关闭",
+    "type": "float",
+    "default": 0.0
+  },
+  "active_reply_cooldown": {
+    "description": "主动搭话冷却秒数：一次主动后，该群在此秒数内不再触发（防刷屏、防空烧API）",
+    "type": "int",
+    "default": 60
+  },
+  "active_reply_prompt": {
+    "description": "主动搭话引导语（作为prompt发给模型，明确它是主动开口而非被搭话）。留空用内置默认",
+    "type": "string",
+    "default": ""
+  },
+  "active_reply_group_whitelist": {
+    "description": "主动搭话群白名单（填群号或unified_msg_origin；留空=对所有群生效）",
+    "type": "list",
+    "default": [],
+    "item_type": "string"
   }
 }

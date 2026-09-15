@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 
 BEIJING = ZoneInfo("Asia/Shanghai")  # 消息时间戳锚定北京
 import uuid
+import random
+import time
 from collections import defaultdict
 from typing import Optional, List, Tuple
 
@@ -25,9 +27,15 @@ except ImportError:
 
 CHATROOM_SYSTEM_PROMPT = "以下是群里你未读的聊天记录，仅供背景参考。用户最新对你说的话在本次消息里，请回应最新消息。"
 DEFAULT_CAPTION_PROMPT = "用中文简要描述这张图片的内容，包括文字、人物、场景等关键信息。"
+DEFAULT_ACTIVE_PROMPT = (
+    "（你正在潜水围观这个群，上面是最近的群聊记录，仅供背景参考。"
+    "此刻你可以主动、自然地插一句你想说的话——但请注意：这些消息并不是对你说的，"
+    "你是自己起意开口，不是在回答谁，也不用逐句回应。"
+    "如果没什么想说的，就只回复 [skip]，不要作任何解释。）"
+)
 
 
-@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、[skip]过滤", "2.0.2")
+@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、概率主动搭话、[skip]过滤", "2.1.0")
 class GroupContextPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -59,6 +67,14 @@ class GroupContextPlugin(Star):
         self.vip_qq = str(self.get_cfg("vip_qq", "") or "")
         self.vip_always_respond = bool(self.get_cfg("vip_always_respond", False))
 
+        # 概率主动搭话
+        self.enable_active_reply = bool(self.get_cfg("enable_active_reply", False))
+        self.active_reply_possibility = float(self.get_cfg("active_reply_possibility", 0.0) or 0.0)
+        self.active_reply_cooldown = int(self.get_cfg("active_reply_cooldown", 60))
+        self.active_reply_prompt = str(self.get_cfg("active_reply_prompt", "") or "")
+        self.active_reply_group_whitelist = self.get_cfg("active_reply_group_whitelist", []) or []
+        self._last_active_ts = {}  # umo -> 上次主动搭话的时间戳，用于冷却
+
         # 启动日志
         logger.info("[celii_gc] 插件已初始化")
         logger.info(f"  合并转发: {'开' if self.enable_forward_analysis else '关'}")
@@ -74,6 +90,12 @@ class GroupContextPlugin(Star):
             logger.info(f"  唤醒词: {self.wake_words}")
         if self.vip_qq:
             logger.info(f"  VIP: {self.vip_qq}, 始终响应: {self.vip_always_respond}")
+        if self.enable_active_reply:
+            logger.info(
+                f"  主动搭话: 开 | 概率={self.active_reply_possibility} | "
+                f"冷却={self.active_reply_cooldown}s | "
+                f"白名单={self.active_reply_group_whitelist or '不限'}"
+            )
 
     def get_cfg(self, key: str, default=None):
         return self.config.get(key, default)
@@ -334,6 +356,72 @@ class GroupContextPlugin(Star):
                     logger.info("[celii_gc] 已降级保存该消息的纯文本")
             except Exception:
                 pass
+            return
+
+        # 概率主动搭话：命中则以"主动开口"的视角发起 LLM 请求。
+        # 触发的群消息只经 on_req_llm 作为背景注入，绝不进 prompt——
+        # 模型因此不会误以为这句话是对它说的（根治官方 active_reply 的老 bug）。
+        async for result in self._maybe_active_reply(event):
+            yield result
+
+    async def _maybe_active_reply(self, event: AstrMessageEvent):
+        """潜水时按概率主动搭话。命中则用'主动开口'的引导语作为 prompt，
+        当前群聊记录由 on_req_llm 作为背景注入，模型不会把群消息当成对自己说的话。
+        用 request_llm(conversation=conv) 是为了带上完整人格与会话历史。"""
+        if not self.enable_active_reply or self.active_reply_possibility <= 0:
+            return
+
+        # 群白名单（群号或 unified_msg_origin，留空=不限）
+        if self.active_reply_group_whitelist:
+            gid = event.get_group_id()
+            umo = event.unified_msg_origin
+            if umo not in self.active_reply_group_whitelist and (
+                not gid or gid not in self.active_reply_group_whitelist
+            ):
+                return
+
+        # 冷却：一次主动后，该群 cooldown 秒内不再触发（防刷屏、防空烧 API）
+        now = time.time()
+        last = self._last_active_ts.get(event.unified_msg_origin, 0.0)
+        if now - last < self.active_reply_cooldown:
+            return
+
+        # 概率骰
+        if random.random() >= self.active_reply_possibility:
+            return
+
+        # 命中：取当前会话，带上完整人格与历史
+        provider = self.context.get_using_provider()
+        if not provider:
+            logger.warning("[celii_gc] 主动搭话：未配置 Provider，跳过")
+            return
+        try:
+            cid = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            if not cid:
+                logger.warning(
+                    "[celii_gc] 主动搭话：当前群无活动会话，跳过"
+                    "（需关闭 平台设置->会话隔离 unique_session，并 /new 建会话）"
+                )
+                return
+            conv = await self.context.conversation_manager.get_conversation(
+                event.unified_msg_origin, cid
+            )
+            if not conv:
+                return
+        except BaseException:
+            logger.error(traceback.format_exc())
+            return
+
+        self._last_active_ts[event.unified_msg_origin] = now
+        prompt = self.active_reply_prompt or DEFAULT_ACTIVE_PROMPT
+        logger.info(f"[celii_gc] 主动搭话触发 | {event.unified_msg_origin}")
+        yield event.request_llm(
+            prompt=prompt,
+            session_id=event.session_id,
+            conversation=conv,
+        )
 
     async def handle_message(self, event: AstrMessageEvent):
         datetime_str = datetime.datetime.now(BEIJING).strftime("%H:%M:%S")
@@ -532,6 +620,49 @@ class GroupContextPlugin(Star):
                 resp.completion_text = ""
                 event.stop_event()
                 return
+
+    def _save_cfg(self, key, value):
+        """把运行时改动写回配置文件，重载后不丢失。"""
+        try:
+            self.config[key] = value
+            self.config.save_config()
+        except BaseException:
+            logger.error(traceback.format_exc())
+
+    @filter.command("主动", alias={"active"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_active(self, event: AstrMessageEvent, arg: str = ""):
+        """在线开关/调概率，即时生效并持久化。用法：/主动、/主动 on|off、/主动 0.1"""
+        arg = (arg or "").strip().lower()
+        if not arg:
+            yield event.plain_result(
+                f"主动搭话：{'开' if self.enable_active_reply else '关'} | "
+                f"概率={self.active_reply_possibility} | 冷却={self.active_reply_cooldown}s\n"
+                f"用法：/主动 on | /主动 off | /主动 0.1（设概率）"
+            )
+            return
+        if arg in ("on", "开", "开启"):
+            self.enable_active_reply = True
+            self._save_cfg("enable_active_reply", True)
+            yield event.plain_result(f"主动搭话已开启，当前概率 {self.active_reply_possibility}")
+            return
+        if arg in ("off", "关", "关闭"):
+            self.enable_active_reply = False
+            self._save_cfg("enable_active_reply", False)
+            yield event.plain_result("主动搭话已关闭")
+            return
+        try:
+            p = float(arg)
+        except ValueError:
+            yield event.plain_result("用法：/主动 on | /主动 off | /主动 0.1（设概率）")
+            return
+        if not 0.0 <= p <= 1.0:
+            yield event.plain_result("概率要在 0~1 之间")
+            return
+        self.active_reply_possibility = p
+        self._save_cfg("active_reply_possibility", p)
+        tip = "" if self.enable_active_reply else "（当前总开关是关的，发 /主动 on 才会生效）"
+        yield event.plain_result(f"主动搭话概率已设为 {p}{tip}")
 
     async def terminate(self):
         logger.info("[celii_gc] 插件已卸载")
