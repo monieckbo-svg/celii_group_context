@@ -6,6 +6,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")  # 消息时间戳锚定北京
 import uuid
 import random
 import time
+import re
 from collections import defaultdict
 from typing import Optional, List, Tuple
 
@@ -25,7 +26,7 @@ except ImportError:
     IS_AIOCQHTTP = False
 
 
-CHATROOM_SYSTEM_PROMPT = "以下是群里你未读的聊天记录，仅供背景参考。用户最新对你说的话在本次消息里，请回应最新消息。"
+CHATROOM_SYSTEM_PROMPT = "以下是群里的聊天记录。每条开头的 [昵称/时间] 标明了这句话是谁、在什么时候说的，请据此分清每一句分别出自谁口，不要把不同人说的话混为一谈。其中带 @你 或喊你名字的那条，才是此刻正在对你说话、需要你回应的人。注意：[昵称/时间] 只是给你辨认发言人用的标签，你自己回复时正常开口即可，切勿在开头加这种前缀。"
 DEFAULT_CAPTION_PROMPT = "用中文简要描述这张图片的内容，包括文字、人物、场景等关键信息。"
 DEFAULT_ACTIVE_PROMPT = (
     "（你正在潜水围观这个群，上面是最近的群聊记录，仅供背景参考。"
@@ -35,7 +36,7 @@ DEFAULT_ACTIVE_PROMPT = (
 )
 
 
-@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、概率主动搭话、[skip]过滤", "2.1.0")
+@register("celii_group_context", "celii-astra", "群聊上下文增强：消息收集、图片转述、合并转发、唤醒词、发言人署名、概率主动搭话、[skip]过滤", "2.2.0")
 class GroupContextPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -552,6 +553,13 @@ class GroupContextPlugin(Star):
     @filter.on_llm_request()
     async def on_req_llm(self, event: AstrMessageEvent, req: ProviderRequest):
         """群聊场景：将session_chats注入LLM请求上下文"""
+        # 给当前"@/唤醒星星"的这条消息补上发言人署名，与下方背景记录同格式——
+        # 原生 prompt 是纯文本、不含发送者，正是模型把这句话认成上一个说话人的根源。
+        if event.is_at_or_wake_command and req.prompt:
+            sender = event.message_obj.sender.nickname or event.get_sender_id() or "某人"
+            ts = datetime.datetime.now(BEIJING).strftime("%H:%M:%S")
+            if not req.prompt.startswith(f"[{sender}/"):
+                req.prompt = f"[{sender}/{ts}]: {req.prompt}"
         # 用 get 判断：键存在但列表为空（上次注入后被clear）也视为无内容，
         # 直接让路，避免注入一条只有CHATROOM_SYSTEM_PROMPT的空壳消息导致模型"看不到新消息"
         if not self.session_chats.get(event.unified_msg_origin):
@@ -620,6 +628,11 @@ class GroupContextPlugin(Star):
                 resp.completion_text = ""
                 event.stop_event()
                 return
+            # 兜底：模型偶尔会模仿背景里的 [昵称/时间]: 排版、在自己回复开头也带一条，清掉
+            cleaned = re.sub(r"^\s*\[[^\]\n]{1,24}/\d{1,2}:\d{2}(?::\d{2})?\]:?\s*", "", resp.completion_text)
+            if cleaned != resp.completion_text:
+                logger.info("[celii_gc] 清除了模型回复开头误带的署名前缀")
+                resp.completion_text = cleaned
 
     def _save_cfg(self, key, value):
         """把运行时改动写回配置文件，重载后不丢失。"""
